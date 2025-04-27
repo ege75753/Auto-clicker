@@ -1,0 +1,18 @@
+{
+    "rage": {
+        "rage_cps": 20,
+        "rage_burst": 3,
+        "rage_jitter": 0.1
+    },
+    "legit": {
+        "legit_min_cps": 8,
+        "legit_max_cps": 12,
+        "legit_variance": 15
+    },
+    "config": {
+        "hold_key": "e",
+        "toggle_key": "f6",
+        "toggle_mode": "hold",
+        "button": "Left"
+    }
+}
