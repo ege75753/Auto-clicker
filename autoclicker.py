@@ -3,6 +3,7 @@ from tkinter import ttk, messagebox, font
 import threading
 import time
 import random
+import math
 import keyboard
 import json
 import os
@@ -10,6 +11,7 @@ import pystray
 from PIL import Image, ImageDraw
 from pynput.mouse import Controller, Button
 from tkinter.colorchooser import askcolor
+import concurrent.futures
 
 mouse_controller = Controller()
 
@@ -18,16 +20,27 @@ clicking = False
 toggled = False
 click_button = Button.left
 current_mode = "Rage"  #track current mode
+stop_threads = False
 
 #rage Settings
-rage_cps = 20
-rage_burst = 3
+rage_cps = 100  # Increased default CPS
+rage_burst = 5
 rage_jitter = 0.1
+rage_burst_mode = "Fixed"     # Fixed/Random/Wave
+min_burst = 1                 # Minimum bursts for random mode
+max_burst = 10                # Maximum bursts for random mode
+wave_peak = 10                # Peak bursts for wave mode
+turbo_mode = False           # New turbo mode for extreme CPS
 
 #legit Settings
 legit_min_cps = 8
 legit_max_cps = 12
 legit_variance = 15
+legit_click_style = "Normal"  # Normal/Butterfly/Jitter/Randomized
+butterfly_delay = 0.05        # Delay between clicks in butterfly mode
+jitter_intensity = 2          # Pixels of mouse jitter
+random_pause_chance = 5       # 1-100% chance to pause
+random_pause_duration = (0.1, 0.3)  # Range for random pauses
 
 #configuration
 hold_key = 'e'
@@ -35,12 +48,13 @@ toggle_key = 'f6'
 toggle_mode = 'hold'  #hold/toggle
 minimize_to_tray = True
 always_on_top = False
+thread_count = 2      # Number of clicking threads for higher performance
 
 #appearance
 color_theme = "light"
 color_palettes = {
     "light": {"bg": "#ffffff", "fg": "#000000", "accent": "#0078d7"},
-    "dark": {"bg": "#1e1e1e", "fg": "#ffffff", "accent": "#00a2ff"},
+    "dark": {"bg": "#2a2a2a", "fg": "#000000", "accent": "#0078d7"},
     "custom": {"bg": "#ffffff", "fg": "#000000", "accent": "#0078d7"}
 }
 
@@ -49,27 +63,46 @@ total_clicks = 0
 session_start_time = None
 session_clicks = 0
 auto_save_stats = True
+click_times = []  # Store recent click times for accurate CPS calculation
+max_click_times = 100  # Maximum number of click times to store
+
+# Thread pool for parallel clicking
+executor = None
 
 def load_settings():
-    global rage_cps, rage_burst, rage_jitter, legit_min_cps, legit_max_cps, legit_variance
-    global hold_key, toggle_key, toggle_mode, minimize_to_tray, always_on_top
-    global click_button, current_mode, color_theme, auto_save_stats, total_clicks
+    global legit_click_style, butterfly_delay, jitter_intensity, random_pause_chance, random_pause_duration
+    global rage_burst_mode, min_burst, max_burst, wave_peak, thread_count, turbo_mode
     
     try:
         with open("config.json", "r") as f:
             data = json.load(f)
-            #rage
-            if "rage" in data:
-                rage_cps = data["rage"].get("rage_cps", rage_cps)
-                rage_burst = data["rage"].get("rage_burst", rage_burst)
-                rage_jitter = data["rage"].get("rage_jitter", rage_jitter)
+            # Add new settings to apply
+            # Legit
+            legit_click_style = legit_style_combo.get()
+            butterfly_delay = float(butterfly_delay_entry.get())
+            jitter_intensity = int(jitter_intensity_entry.get())
+            random_pause_chance = int(pause_chance_entry.get())
+            random_pause_duration = tuple(map(float, pause_duration_entry.get().split(',')))
+            legit_click_style = data["legit"].get("click_style", "Normal")
+            butterfly_delay = data["legit"].get("butterfly_delay", 0.05)
+            jitter_intensity = data["legit"].get("jitter_intensity", 2)
+            random_pause_chance = data["legit"].get("pause_chance", 5)
+            random_pause_duration = tuple(data["legit"].get("pause_duration", (0.1, 0.3)))
             
-            #legit
-            if "legit" in data:
-                legit_min_cps = data["legit"].get("legit_min_cps", legit_min_cps)
-                legit_max_cps = data["legit"].get("legit_max_cps", legit_max_cps)
-                legit_variance = data["legit"].get("legit_variance", legit_variance)
+            # Rage
+            rage_burst_mode = rage_burst_combo.get()
+            min_burst = int(min_burst_entry.get())
+            max_burst = int(max_burst_entry.get())
+            wave_peak = int(wave_peak_entry.get())
+            rage_burst_mode = data["rage"].get("burst_mode", "Fixed")
+            min_burst = data["rage"].get("min_burst", 1)
+            max_burst = data["rage"].get("max_burst", 5)
+            wave_peak = data["rage"].get("wave_peak", 5)
+            turbo_mode = data["rage"].get("turbo_mode", False)
             
+            # Performance settings
+            thread_count = data.get("performance", {}).get("thread_count", 2)
+                
             #config
             if "config" in data:
                 hold_key = data["config"].get("hold_key", hold_key)
@@ -100,12 +133,22 @@ def save_settings():
         "rage": {
             "rage_cps": rage_cps,
             "rage_burst": rage_burst,
-            "rage_jitter": rage_jitter
+            "rage_jitter": rage_jitter,
+            "burst_mode": rage_burst_mode,
+            "min_burst": min_burst,
+            "max_burst": max_burst,
+            "wave_peak": wave_peak,
+            "turbo_mode": turbo_mode
         },
         "legit": {
             "legit_min_cps": legit_min_cps,
             "legit_max_cps": legit_max_cps,
-            "legit_variance": legit_variance
+            "legit_variance": legit_variance,
+            "click_style": legit_click_style,
+            "butterfly_delay": butterfly_delay,
+            "jitter_intensity": jitter_intensity,
+            "pause_chance": random_pause_chance,
+            "pause_duration": random_pause_duration
         },
         "config": {
             "hold_key": hold_key,
@@ -123,6 +166,9 @@ def save_settings():
             "total_clicks": total_clicks,
             "auto_save_stats": auto_save_stats
         },
+        "performance": {
+            "thread_count": thread_count
+        },
         "current_mode": current_mode
     }
     try:
@@ -131,38 +177,131 @@ def save_settings():
     except Exception as e:
         messagebox.showerror("Error", f"Could not save settings: {str(e)}")
 
-def clicker():
-    global clicking, total_clicks, session_clicks
+def perform_click():
+    """Execute a single click event"""
+    global total_clicks, session_clicks, click_times
+    
+    mouse_controller.click(click_button)
+    total_clicks += 1
+    session_clicks += 1
+    
+    # Record click time for accurate CPS calculation
+    current_time = time.time()
+    click_times.append(current_time)
+    if len(click_times) > max_click_times:
+        click_times.pop(0)
+
+def rage_clicker_worker():
+    """Worker function for rage clicking mode"""
+    global clicking, total_clicks, session_clicks, stop_threads
+    burst_wave_counter = 0  # For wave burst mode
+
     while True:
+        if stop_threads:
+            break
         try:
-            if clicking:
-                if current_mode == "Rage":
-                    #rage clicking with burst and jitter
-                    for _ in range(rage_burst):
-                        if not clicking:  #check if we should stop mid-burst
-                            break
-                        mouse_controller.click(click_button)
-                        total_clicks += 1
-                        session_clicks += 1
-                        if stats_frame:
-                            update_stats_display()
+            if clicking and current_mode == "Rage":
+                # Calculate burst count based on mode
+                if rage_burst_mode == "Fixed":
+                    burst = rage_burst
+                elif rage_burst_mode == "Random":
+                    burst = random.randint(min_burst, max_burst)
+                elif rage_burst_mode == "Wave":
+                    burst = int((math.sin(burst_wave_counter) + 1) * wave_peak / 2)
+                    burst_wave_counter += 0.5
+
+                for _ in range(burst):
+                    if stop_threads or not clicking:
+                        break
+
+                    perform_click()
+                    update_stats_display()
+
+                    # In turbo mode, reduce delay to minimum possible
+                    if turbo_mode:
+                        time.sleep(0.001)  # Absolute minimum delay
+                    else:
                         jitter = 1 + random.uniform(-rage_jitter, rage_jitter)
                         time.sleep(max(0.001, (1 / rage_cps) * jitter))
-                else:
-                    #legit human-like clicking
-                    cps = random.randint(legit_min_cps, legit_max_cps)
-                    variance = random.uniform(1 - legit_variance/100, 1 + legit_variance/100)
-                    mouse_controller.click(click_button)
-                    total_clicks += 1
-                    session_clicks += 1
-                    if stats_frame:
-                        update_stats_display()
-                    time.sleep(max(0.001, (1 / cps) * variance))
             else:
                 time.sleep(0.01)
         except Exception as e:
-            print(f"Error in clicker thread: {e}")
+            print(f"Error in rage clicker thread: {e}")
             time.sleep(0.1)
+
+def legit_clicker_worker():
+    """Worker function for legit clicking mode"""
+    global clicking, total_clicks, session_clicks, stop_threads
+
+    while True:
+        if stop_threads:
+            break
+        try:
+            if clicking and current_mode == "Legit":
+                cps = random.uniform(legit_min_cps, legit_max_cps)
+                variance = random.uniform(1 - legit_variance/100, 1 + legit_variance/100)
+                delay = max(0.001, (1 / cps) * variance)
+
+                # Random pause check
+                if random.randint(1, 100) <= random_pause_chance:
+                    pause_time = random.uniform(*random_pause_duration)
+                    time.sleep(pause_time)
+
+                if legit_click_style == "Butterfly":
+                    perform_click()
+                    time.sleep(butterfly_delay)
+                    perform_click()
+                    # Sleep for the rest of the interval so total = delay
+                    remaining = delay - butterfly_delay
+                    if remaining > 0:
+                        time.sleep(remaining)
+                elif legit_click_style == "Jitter":
+                    original_pos = mouse_controller.position
+                    jitter_x = original_pos[0] + random.randint(-jitter_intensity, jitter_intensity)
+                    jitter_y = original_pos[1] + random.randint(-jitter_intensity, jitter_intensity)
+                    mouse_controller.position = (jitter_x, jitter_y)
+                    perform_click()
+                    mouse_controller.position = original_pos
+                    time.sleep(delay)
+                else:
+                    perform_click()
+                    time.sleep(delay)
+
+                update_stats_display()
+            else:
+                time.sleep(0.01)
+        except Exception as e:
+            print(f"Error in legit clicker thread: {e}")
+            time.sleep(0.1)
+def clicker():
+    """Main clicking function that distributes work to worker threads"""
+    # This function now delegates to worker threads
+    # We'll start worker threads from the main thread
+    pass
+
+def start_clicker_threads():
+    """Start the appropriate number of clicking threads based on settings"""
+    global executor, stop_threads
+
+    # Signal old threads to stop
+    stop_threads = True
+    time.sleep(0.05)  # Give threads a moment to exit
+
+    # Clean up existing executor if needed
+    if executor is not None:
+        executor.shutdown(wait=False)
+
+    # Reset stop flag and start new threads
+    stop_threads = False
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=thread_count)
+
+    # Submit rage worker threads
+    for _ in range(thread_count // 2 or 1):
+        executor.submit(rage_clicker_worker)
+
+    # Submit legit worker threads
+    for _ in range(thread_count // 2 or 1):
+        executor.submit(legit_clicker_worker)
 
 def monitor_keys():
     global clicking, toggled
@@ -272,18 +411,40 @@ def hide_to_tray():
     else:
         root.iconify()
 
+def validate_legit_settings():
+    try:
+        min_cps = float(legit_min_entry.get())
+        max_cps = float(legit_max_entry.get())
+        variance = int(legit_variance_entry.get())
+        
+        if min_cps <= 0 or max_cps <= 0:
+            raise ValueError("CPS values must be positive")
+        if max_cps < min_cps:
+            raise ValueError("Max CPS cannot be less than Min CPS")
+        if variance < 0 or variance > 100:
+            raise ValueError("Variance must be between 0-100%")
+        
+        return True
+    except ValueError as e:
+        messagebox.showerror("Invalid Settings", str(e))
+        return False
+
 def apply_settings(save=False):
-    global current_mode, rage_cps, rage_burst, rage_jitter
+    if not validate_legit_settings():
+        return
+    global current_mode, rage_cps, rage_burst, rage_jitter, turbo_mode
     global legit_min_cps, legit_max_cps, legit_variance
     global click_button, hold_key, toggle_key, toggle_mode
     global minimize_to_tray, always_on_top, auto_save_stats
+    global thread_count
     
     try:
         #rage settings
         rage_cps = int(float(rage_cps_entry.get()))
         rage_burst = int(float(rage_burst_entry.get()))
         rage_jitter = float(rage_jitter_entry.get())
-        
+        turbo_mode = turbo_var.get()
+
         #legit settings
         legit_min_cps = int(float(legit_min_entry.get()))
         legit_max_cps = int(float(legit_max_entry.get()))
@@ -298,8 +459,14 @@ def apply_settings(save=False):
         always_on_top = always_top_var.get()
         auto_save_stats = auto_save_var.get()
         
+        # Performance settings
+        thread_count = int(thread_count_entry.get())
+        
         current_mode = mode_switch.get()
         root.attributes('-topmost', always_on_top)
+        
+        # Restart clicking threads with new settings
+        start_clicker_threads()
         
         #update ui
         update_status_indicator()
@@ -310,6 +477,19 @@ def apply_settings(save=False):
     except Exception as e:
         messagebox.showerror("Error", f"Invalid settings: {str(e)}")
 
+def calculate_current_cps():
+    """Calculate actual CPS based on recent click times"""
+    if len(click_times) < 2:
+        return 0
+    
+    # Calculate time difference between oldest and newest click
+    time_span = click_times[-1] - click_times[0]
+    if time_span <= 0:
+        return 0
+    
+    # Calculate clicks per second
+    return (len(click_times) - 1) / time_span
+
 def update_stats_display():
     if not hasattr(update_stats_display, "last_update") or time.time() - update_stats_display.last_update > 0.2:
         current_session_time = time.time() - session_start_time if session_start_time else 0
@@ -319,7 +499,7 @@ def update_stats_display():
         session_time_str = f"{int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}"
         
         #calculate cps for this session
-        current_cps = session_clicks / current_session_time if current_session_time > 0 else 0
+        current_cps = calculate_current_cps()
         
         #update labels
         total_clicks_value.config(text=str(total_clicks))
@@ -334,12 +514,13 @@ def update_stats_display():
         update_stats_display.last_update = time.time()
 
 def reset_stats():
-    global total_clicks, session_clicks, session_start_time
+    global total_clicks, session_clicks, session_start_time, click_times
     
     if messagebox.askyesno("Reset Stats", "Are you sure you want to reset all statistics?"):
         total_clicks = 0
         session_clicks = 0
         session_start_time = time.time() if clicking else None
+        click_times = []
         update_stats_display()
         save_settings()
 
@@ -350,7 +531,8 @@ def export_settings():
                 "rage": {
                     "rage_cps": rage_cps,
                     "rage_burst": rage_burst,
-                    "rage_jitter": rage_jitter
+                    "rage_jitter": rage_jitter,
+                    "turbo_mode": turbo_mode
                 },
                 "legit": {
                     "legit_min_cps": legit_min_cps,
@@ -362,6 +544,9 @@ def export_settings():
                     "toggle_key": toggle_key,
                     "toggle_mode": toggle_mode,
                     "button": "Left" if click_button == Button.left else "Right"
+                },
+                "performance": {
+                    "thread_count": thread_count
                 }
             }, f, indent=4)
         messagebox.showinfo("Export Successful", "Settings exported to autoclicker_export.json")
@@ -387,6 +572,8 @@ def import_settings():
                 
                 rage_jitter_entry.delete(0, tk.END)
                 rage_jitter_entry.insert(0, str(data["rage"].get("rage_jitter", rage_jitter)))
+                
+                turbo_var.set(data["rage"].get("turbo_mode", False))
             
             #import legit settings
             if "legit" in data:
@@ -409,15 +596,20 @@ def import_settings():
                 
                 mode_choice.set(data["config"].get("toggle_mode", toggle_mode))
                 button_choice.set(data["config"].get("button", "Left"))
+                
+            # Import performance settings
+            if "performance" in data:
+                thread_count_entry.delete(0, tk.END)
+                thread_count_entry.insert(0, str(data["performance"].get("thread_count", thread_count)))
         
         messagebox.showinfo("Import Successful", "Settings imported successfully!")
     except Exception as e:
         messagebox.showerror("Import Failed", f"Error: {str(e)}")
 
-#gui setup
+#gui yahuhuauhauh
 root = tk.Tk()
-root.title("Auto Clicker")
-root.geometry("640x520")
+root.title("Enhanced Auto Clicker")
+root.geometry("640x580")  # Increased height for new options
 root.protocol("WM_DELETE_WINDOW", hide_to_tray)
 
 #create variables for placeholders
@@ -459,12 +651,14 @@ legit_frame = ttk.Frame(tab_control)
 config_frame = ttk.Frame(tab_control)
 appearance_frame = ttk.Frame(tab_control)
 stats_frame = ttk.Frame(tab_control)
+performance_frame = ttk.Frame(tab_control)  # New performance tab
 
 tab_control.add(rage_frame, text="Rage")
 tab_control.add(legit_frame, text="Legit")
 tab_control.add(config_frame, text="Config")
 tab_control.add(appearance_frame, text="Appearance")
 tab_control.add(stats_frame, text="Stats")
+tab_control.add(performance_frame, text="Performance")  # Added performance tab
 tab_control.pack(expand=1, fill="both", padx=10, pady=5)
 
 #rage tab
@@ -480,8 +674,31 @@ ttk.Label(rage_frame, text="Jitter (0-1):").grid(row=2, column=0, padx=10, pady=
 rage_jitter_entry = ttk.Entry(rage_frame)
 rage_jitter_entry.grid(row=2, column=1, padx=10, pady=5)
 
-ttk.Label(rage_frame, text="Rage mode is designed for high speed clicking\nwith configurable burst patterns.", 
-          font=("Arial", 9, "italic")).grid(row=3, column=0, columnspan=2, pady=20)
+# Inside rage_frame grid
+ttk.Label(rage_frame, text="Burst Mode:").grid(row=3, column=0, padx=10, pady=5, sticky="w")
+rage_burst_combo = ttk.Combobox(rage_frame, values=["Fixed", "Random", "Wave"], state="readonly")
+rage_burst_combo.grid(row=3, column=1, padx=10, pady=5)
+
+ttk.Label(rage_frame, text="Min Burst:").grid(row=4, column=0, padx=10, pady=5, sticky="w")
+min_burst_entry = ttk.Entry(rage_frame)
+min_burst_entry.grid(row=4, column=1, padx=10, pady=5)
+
+ttk.Label(rage_frame, text="Max Burst:").grid(row=5, column=0, padx=10, pady=5, sticky="w")
+max_burst_entry = ttk.Entry(rage_frame)
+max_burst_entry.grid(row=5, column=1, padx=10, pady=5)
+
+ttk.Label(rage_frame, text="Wave Peak:").grid(row=6, column=0, padx=10, pady=5, sticky="w")
+wave_peak_entry = ttk.Entry(rage_frame)
+wave_peak_entry.grid(row=6, column=1, padx=10, pady=5)
+
+# Turbo Mode Option
+turbo_var = tk.BooleanVar(value=turbo_mode)
+turbo_check = ttk.Checkbutton(rage_frame, text="Turbo Mode (Maximum CPS)", variable=turbo_var)
+turbo_check.grid(row=7, column=0, columnspan=2, padx=10, pady=5, sticky="w")
+
+# Turbo Mode Info
+ttk.Label(rage_frame, text="Turbo Mode ignores CPS limits and clicks as fast as possible", 
+          font=("Arial", 8, "italic")).grid(row=8, column=0, columnspan=2, padx=10, pady=0, sticky="w")
 
 #legit tab
 ttk.Label(legit_frame, text="Min CPS:").grid(row=0, column=0, padx=10, pady=5, sticky="w")
@@ -495,217 +712,159 @@ legit_max_entry.grid(row=1, column=1, padx=10, pady=5)
 ttk.Label(legit_frame, text="Variance (%):").grid(row=2, column=0, padx=10, pady=5, sticky="w")
 legit_variance_entry = ttk.Entry(legit_frame)
 legit_variance_entry.grid(row=2, column=1, padx=10, pady=5)
+ttk.Label(legit_frame, text="Click Style:").grid(row=3, column=0, padx=10, pady=5, sticky="w")
+legit_style_combo = ttk.Combobox(legit_frame, values=["Normal", "Butterfly", "Jitter", "Randomized"], state="readonly")
+legit_style_combo.grid(row=3, column=1, padx=10, pady=5)
 
-ttk.Label(legit_frame, text="Legit mode mimics human clicking patterns\nwith natural timing variations.",
-          font=("Arial", 9, "italic")).grid(row=3, column=0, columnspan=2, pady=20)
+ttk.Label(legit_frame, text="Butterfly Delay (s):").grid(row=4, column=0, padx=10, pady=5, sticky="w")
+butterfly_delay_entry = ttk.Entry(legit_frame)
+butterfly_delay_entry.grid(row=4, column=1, padx=10, pady=5)
 
-#config Tab
-ttk.Label(config_frame, text="Control Mode:").grid(row=0, column=0, padx=10, pady=5, sticky="w")
-mode_choice = ttk.Combobox(config_frame, values=["hold", "toggle"], state="readonly")
-mode_choice.grid(row=0, column=1, padx=10, pady=5)
+ttk.Label(legit_frame, text="Jitter Intensity (px):").grid(row=5, column=0, padx=10, pady=5, sticky="w")
+jitter_intensity_entry = ttk.Entry(legit_frame)
+jitter_intensity_entry.grid(row=5, column=1, padx=10, pady=5)
 
-ttk.Label(config_frame, text="Mouse Button:").grid(row=1, column=0, padx=10, pady=5, sticky="w")
-button_choice = ttk.Combobox(config_frame, values=["Left", "Right"], state="readonly")
-button_choice.grid(row=1, column=1, padx=10, pady=5)
+ttk.Label(legit_frame, text="Pause Chance (%):").grid(row=6, column=0, padx=10, pady=5, sticky="w")
+pause_chance_entry = ttk.Entry(legit_frame)
+pause_chance_entry.grid(row=6, column=1, padx=10, pady=5)
 
-ttk.Label(config_frame, text="Hold Key:").grid(row=2, column=0, padx=10, pady=5, sticky="w")
-hold_key_entry = ttk.Entry(config_frame)
-hold_key_entry.grid(row=2, column=1, padx=10, pady=5)
+ttk.Label(legit_frame, text="Pause Duration (min,max):").grid(row=7, column=0, padx=10, pady=5, sticky="w")
+pause_duration_entry = ttk.Entry(legit_frame)
+pause_duration_entry.grid(row=7, column=1, padx=10, pady=5)
 
-ttk.Label(config_frame, text="Toggle Key:").grid(row=3, column=0, padx=10, pady=5, sticky="w")
-toggle_key_entry = ttk.Entry(config_frame)
-toggle_key_entry.grid(row=3, column=1, padx=10, pady=5)
+#config tab
+ttk.Label(config_frame, text="Activation Key:").grid(row=0, column=0, padx=10, pady=5, sticky="w")
+hold_key_entry = ttk.Entry(config_frame, width=5)
+hold_key_entry.grid(row=0, column=1, padx=10, pady=5, sticky="w")
 
-minimize_var = tk.BooleanVar()
-ttk.Checkbutton(config_frame, text="Minimize to Tray", variable=minimize_var).grid(row=4, column=0, padx=10, pady=5, sticky="w")
-always_top_var = tk.BooleanVar()
-ttk.Checkbutton(config_frame, text="Always on Top", variable=always_top_var).grid(row=4, column=1, padx=10, pady=5, sticky="w")
+ttk.Label(config_frame, text="Toggle Key:").grid(row=1, column=0, padx=10, pady=5, sticky="w")
+toggle_key_entry = ttk.Entry(config_frame, width=5)
+toggle_key_entry.grid(row=1, column=1, padx=10, pady=5, sticky="w")
 
-#import/export buttons
-ttk.Button(config_frame, text="Export Settings", command=export_settings).grid(row=5, column=0, pady=10)
-ttk.Button(config_frame, text="Import Settings", command=import_settings).grid(row=5, column=1, pady=10)
+ttk.Label(config_frame, text="Activation Mode:").grid(row=2, column=0, padx=10, pady=5, sticky="w")
+mode_choice = ttk.Combobox(config_frame, values=["hold", "toggle"], state="readonly", width=8)
+mode_choice.grid(row=2, column=1, padx=10, pady=5, sticky="w")
 
-#apply/save buttons
-ttk.Button(config_frame, text="Apply", command=lambda: apply_settings()).grid(row=6, column=0, pady=10)
-ttk.Button(config_frame, text="Save", command=lambda: apply_settings(True)).grid(row=6, column=1, pady=10)
+ttk.Label(config_frame, text="Mouse Button:").grid(row=3, column=0, padx=10, pady=5, sticky="w")
+button_choice = ttk.Combobox(config_frame, values=["Left", "Right"], state="readonly", width=8)
+button_choice.grid(row=3, column=1, padx=10, pady=5, sticky="w")
+
+minimize_var = tk.BooleanVar(value=minimize_to_tray)
+minimize_check = ttk.Checkbutton(config_frame, text="Minimize to Tray", variable=minimize_var)
+minimize_check.grid(row=4, column=0, columnspan=2, padx=10, pady=5, sticky="w")
+
+always_top_var = tk.BooleanVar(value=always_on_top)
+always_top_check = ttk.Checkbutton(config_frame, text="Always on Top", variable=always_top_var)
+always_top_check.grid(row=5, column=0, columnspan=2, padx=10, pady=5, sticky="w")
 
 #appearance tab
-ttk.Label(appearance_frame, text="Theme Selection:").grid(row=0, column=0, padx=10, pady=10, sticky="w")
-theme_frame = ttk.Frame(appearance_frame)
-theme_frame.grid(row=0, column=1, padx=10, pady=10)
+theme_frame = ttk.LabelFrame(appearance_frame, text="Color Theme")
+theme_frame.pack(padx=10, pady=5, fill=tk.X)
 
-light_button = ttk.Button(theme_frame, text="Light", command=lambda: change_theme("light"))
-light_button.pack(side=tk.LEFT, padx=5)
+ttk.Radiobutton(theme_frame, text="Light", value="light", variable=color_theme, 
+                command=lambda: change_theme("light")).pack(side=tk.LEFT, padx=5)
+ttk.Radiobutton(theme_frame, text="Dark", value="dark", variable=color_theme,
+                command=lambda: change_theme("dark")).pack(side=tk.LEFT, padx=5)
+ttk.Radiobutton(theme_frame, text="Custom", value="custom", variable=color_theme,
+                command=lambda: change_theme("custom")).pack(side=tk.LEFT, padx=5)
 
-dark_button = ttk.Button(theme_frame, text="Dark", command=lambda: change_theme("dark"))
-dark_button.pack(side=tk.LEFT, padx=5)
+color_preview_frame = ttk.Frame(appearance_frame)
+color_preview_frame.pack(padx=10, pady=5, fill=tk.X)
 
-custom_button = ttk.Button(theme_frame, text="Custom", command=lambda: change_theme("custom"))
-custom_button.pack(side=tk.LEFT, padx=5)
-
-#custom Colors
-ttk.Label(appearance_frame, text="Custom Colors:").grid(row=1, column=0, padx=10, pady=10, sticky="w")
-custom_colors_frame = ttk.Frame(appearance_frame)
-custom_colors_frame.grid(row=1, column=1, padx=10, pady=10)
-
-#background color
-bg_frame = ttk.Frame(custom_colors_frame)
-bg_frame.pack(fill=tk.X, pady=5)
-ttk.Label(bg_frame, text="Background:").pack(side=tk.LEFT)
-bg_preview = tk.Label(bg_frame, width=3, height=1, borderwidth=1, relief="solid", background=color_palettes["custom"]["bg"])
+ttk.Label(color_preview_frame, text="Background:").pack(side=tk.LEFT, padx=5)
+bg_preview = tk.Label(color_preview_frame, width=6, relief=tk.SUNKEN)
 bg_preview.pack(side=tk.LEFT, padx=5)
-ttk.Button(bg_frame, text="Choose", command=lambda: choose_custom_color("bg")).pack(side=tk.LEFT)
+ttk.Button(color_preview_frame, text="Choose", 
+          command=lambda: choose_custom_color("bg")).pack(side=tk.LEFT, padx=5)
 
-#foreground color
-fg_frame = ttk.Frame(custom_colors_frame)
-fg_frame.pack(fill=tk.X, pady=5)
-ttk.Label(fg_frame, text="Text:").pack(side=tk.LEFT)
-fg_preview = tk.Label(fg_frame, width=3, height=1, borderwidth=1, relief="solid", background=color_palettes["custom"]["fg"])
+ttk.Label(color_preview_frame, text="Text:").pack(side=tk.LEFT, padx=5)
+fg_preview = tk.Label(color_preview_frame, width=6, relief=tk.SUNKEN)
 fg_preview.pack(side=tk.LEFT, padx=5)
-ttk.Button(fg_frame, text="Choose", command=lambda: choose_custom_color("fg")).pack(side=tk.LEFT)
+ttk.Button(color_preview_frame, text="Choose",
+          command=lambda: choose_custom_color("fg")).pack(side=tk.LEFT, padx=5)
 
-#accent color
-accent_frame = ttk.Frame(custom_colors_frame)
-accent_frame.pack(fill=tk.X, pady=5)
-ttk.Label(accent_frame, text="Accent:").pack(side=tk.LEFT)
-accent_preview = tk.Label(accent_frame, width=3, height=1, borderwidth=1, relief="solid", background=color_palettes["custom"]["accent"])
+ttk.Label(color_preview_frame, text="Accent:").pack(side=tk.LEFT, padx=5)
+accent_preview = tk.Label(color_preview_frame, width=6, relief=tk.SUNKEN)
 accent_preview.pack(side=tk.LEFT, padx=5)
-ttk.Button(accent_frame, text="Choose", command=lambda: choose_custom_color("accent")).pack(side=tk.LEFT)
+ttk.Button(color_preview_frame, text="Choose",
+          command=lambda: choose_custom_color("accent")).pack(side=tk.LEFT, padx=5)
 
-ttk.Button(appearance_frame, text="Save Theme", command=lambda: apply_settings(True)).grid(row=2, column=1, pady=20)
+#stats tab
+stats_grid = ttk.Frame(stats_frame)
+stats_grid.pack(padx=10, pady=10)
 
-#stats Tab
-stats_header = ttk.Frame(stats_frame)
-stats_header.pack(fill=tk.X, pady=10)
+ttk.Label(stats_grid, text="Total Clicks:").grid(row=0, column=0, padx=5, pady=5, sticky="e")
+total_clicks_value = ttk.Label(stats_grid, text="0")
+total_clicks_value.grid(row=0, column=1, padx=5, pady=5)
 
-ttk.Label(stats_header, text="Clicking Statistics", font=("Arial", 12, "bold")).pack(side=tk.LEFT, padx=10)
+ttk.Label(stats_grid, text="Session Clicks:").grid(row=1, column=0, padx=5, pady=5, sticky="e")
+session_clicks_value = ttk.Label(stats_grid, text="0")
+session_clicks_value.grid(row=1, column=1, padx=5, pady=5)
+
+ttk.Label(stats_grid, text="Session Time:").grid(row=2, column=0, padx=5, pady=5, sticky="e")
+session_time_value = ttk.Label(stats_grid, text="00:00:00")
+session_time_value.grid(row=2, column=1, padx=5, pady=5)
+
+ttk.Label(stats_grid, text="Current CPS:").grid(row=3, column=0, padx=5, pady=5, sticky="e")
+current_cps_value = ttk.Label(stats_grid, text="0.00")
+current_cps_value.grid(row=3, column=1, padx=5, pady=5)
+
 auto_save_var = tk.BooleanVar(value=auto_save_stats)
-ttk.Checkbutton(stats_header, text="Auto-save stats", variable=auto_save_var).pack(side=tk.RIGHT, padx=10)
+auto_save_check = ttk.Checkbutton(stats_frame, text="Auto-save Statistics", variable=auto_save_var)
+auto_save_check.pack(pady=5)
 
-#stats display
-stats_display = ttk.Frame(stats_frame)
-stats_display.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
-
-#total clicks
-total_row = ttk.Frame(stats_display)
-total_row.pack(fill=tk.X, pady=5)
-ttk.Label(total_row, text="Total Clicks:", font=("Arial", 10, "bold")).pack(side=tk.LEFT)
-total_clicks_value = ttk.Label(total_row, text="0")
-total_clicks_value.pack(side=tk.RIGHT)
-
-#session clicks
-session_row = ttk.Frame(stats_display)
-session_row.pack(fill=tk.X, pady=5)
-ttk.Label(session_row, text="Session Clicks:", font=("Arial", 10, "bold")).pack(side=tk.LEFT)
-session_clicks_value = ttk.Label(session_row, text="0")
-session_clicks_value.pack(side=tk.RIGHT)
-
-#session time
-time_row = ttk.Frame(stats_display)
-time_row.pack(fill=tk.X, pady=5)
-ttk.Label(time_row, text="Session Time:", font=("Arial", 10, "bold")).pack(side=tk.LEFT)
-session_time_value = ttk.Label(time_row, text="00:00:00")
-session_time_value.pack(side=tk.RIGHT)
-
-#current CPS
-cps_row = ttk.Frame(stats_display)
-cps_row.pack(fill=tk.X, pady=5)
-ttk.Label(cps_row, text="Current CPS:", font=("Arial", 10, "bold")).pack(side=tk.LEFT)
-current_cps_value = ttk.Label(cps_row, text="0.00")
-current_cps_value.pack(side=tk.RIGHT)
-
-#reset button
 reset_button = ttk.Button(stats_frame, text="Reset Statistics", command=reset_stats)
-reset_button.pack(pady=20)
+reset_button.pack(pady=5)
 
-#action buttons at the bottom
-action_frame = tk.Frame(root)
-action_frame.pack(fill=tk.X, pady=10)
+#performance tab
+ttk.Label(performance_frame, text="Thread Count:").grid(row=0, column=0, padx=10, pady=5, sticky="w")
+thread_count_entry = ttk.Entry(performance_frame)
+thread_count_entry.grid(row=0, column=1, padx=10, pady=5)
 
-hotkey_info = ttk.Label(action_frame, text=f"Hotkeys: Hold={hold_key}, Toggle={toggle_key}")
-hotkey_info.pack(side=tk.LEFT, padx=10)
+#control buttons
+button_frame = ttk.Frame(root)
+button_frame.pack(pady=10)
 
-apply_button = ttk.Button(action_frame, text="Apply All Settings", command=lambda: apply_settings())
-apply_button.pack(side=tk.RIGHT, padx=10)
-save_button = ttk.Button(action_frame,)
-save_button = ttk.Button(action_frame, text="Save All Settings", command=lambda: apply_settings(True))
-save_button.pack(side=tk.RIGHT, padx=5)
+apply_button = ttk.Button(button_frame, text="Apply Settings", command=lambda: apply_settings())
+apply_button.pack(side=tk.LEFT, padx=5)
 
-#set initial values
-def populate_fields():
-    #rage
-    rage_cps_entry.delete(0, tk.END)
-    rage_cps_entry.insert(0, str(rage_cps))
-    
-    rage_burst_entry.delete(0, tk.END)
-    rage_burst_entry.insert(0, str(rage_burst))
-    
-    rage_jitter_entry.delete(0, tk.END)
-    rage_jitter_entry.insert(0, str(rage_jitter))
-    
-    #legit
-    legit_min_entry.delete(0, tk.END)
-    legit_min_entry.insert(0, str(legit_min_cps))
-    
-    legit_max_entry.delete(0, tk.END)
-    legit_max_entry.insert(0, str(legit_max_cps))
-    
-    legit_variance_entry.delete(0, tk.END)
-    legit_variance_entry.insert(0, str(legit_variance))
-    
-    #config
-    mode_choice.set(toggle_mode)
-    button_choice.set("Left" if click_button == Button.left else "Right")
-    
-    hold_key_entry.delete(0, tk.END)
-    hold_key_entry.insert(0, hold_key)
-    
-    toggle_key_entry.delete(0, tk.END)
-    toggle_key_entry.insert(0, toggle_key)
-    
-    minimize_var.set(minimize_to_tray)
-    always_top_var.set(always_on_top)
-    auto_save_var.set(auto_save_stats)
+save_button = ttk.Button(button_frame, text="Save", command=lambda: apply_settings(True))
+save_button.pack(side=tk.LEFT, padx=5)
 
-    #update hotkey info
-    hotkey_info.config(text=f"Hotkeys: Hold={hold_key}, Toggle={toggle_key}")
-    
-    #apply theme
-    apply_theme()
-    update_color_preview()
-    update_status_indicator()
-    
-    #set window properties
-    root.attributes('-topmost', always_on_top)
+export_button = ttk.Button(button_frame, text="Export", command=export_settings)
+export_button.pack(side=tk.LEFT, padx=5)
 
-#key detection for hold/toggle keys
-def key_recorder(entry):
-    def record_key(e):
-        if e.keysym.lower() not in ('return', 'escape'):
-            entry.delete(0, tk.END)
-            entry.insert(0, e.keysym.lower())
-            return "break"  # Prevent default action
-    return record_key
+import_button = ttk.Button(button_frame, text="Import", command=import_settings)
+import_button.pack(side=tk.LEFT, padx=5)
 
-#bind key recording to entry fields
-hold_key_entry.bind("<Key>", key_recorder(hold_key_entry))
-toggle_key_entry.bind("<Key>", key_recorder(toggle_key_entry))
-
-#initialization
-load_settings()
-populate_fields()
+#initialize default values
+rage_cps_entry.insert(0, str(rage_cps))
+rage_burst_entry.insert(0, str(rage_burst))
+rage_jitter_entry.insert(0, str(rage_jitter))
+legit_min_entry.insert(0, str(legit_min_cps))
+legit_max_entry.insert(0, str(legit_max_cps))
+legit_variance_entry.insert(0, str(legit_variance))
+butterfly_delay_entry.insert(0, str(butterfly_delay))
+jitter_intensity_entry.insert(0, str(jitter_intensity))
+pause_chance_entry.insert(0, str(random_pause_chance))
+pause_duration_entry.insert(0, ",".join(map(str, random_pause_duration)))
+hold_key_entry.insert(0, hold_key)
+toggle_key_entry.insert(0, toggle_key)
+mode_choice.set(toggle_mode)
+button_choice.set("Left" if click_button == Button.left else "Right")
+rage_burst_combo.set(rage_burst_mode)
+min_burst_entry.insert(0, str(min_burst))
+max_burst_entry.insert(0, str(max_burst))
+wave_peak_entry.insert(0, str(wave_peak))
+legit_style_combo.set(legit_click_style)
+thread_count_entry.insert(0, str(thread_count))
 
 #start threads
-clicker_thread = threading.Thread(target=clicker, daemon=True)
-key_monitor_thread = threading.Thread(target=monitor_keys, daemon=True)
-clicker_thread.start()
-key_monitor_thread.start()
+start_clicker_threads()
+key_thread = threading.Thread(target=monitor_keys, daemon=True)
+key_thread.start()
 
-#main loop
+#apply theme and run
+apply_theme()
+update_color_preview()
 root.mainloop()
-
-if auto_save_stats:
-    try:
-        save_settings()
-    except:
-        pass
